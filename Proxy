@@ -1,0 +1,466 @@
+// Proxy.cpp : Defines the entry point for the console application.
+//
+
+#include "stdafx.h"
+#include "Proxy.h"
+#include "afxsock.h"
+#include <iostream>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <fstream>
+
+#ifdef _DEBUG
+#define new DEBUG_NEW
+#endif
+
+#define HTTP "http://"
+#define PORT 8888
+#define HTTPPORT 80
+#define BSIZE 10000
+
+
+// The one and only application object
+
+CWinApp theApp;
+
+using namespace std;
+int global = 0;
+//struct chứa thông tin của Client và Server để chia sẻ giữa các Thread
+struct CapSocket {
+	SOCKET Server;
+	SOCKET Client;
+	bool IsServerClosed;
+	bool IsClientClosed;
+};
+//struct chứa các thông tin của một truy vấn
+struct TruyVan {
+	string address;
+	HANDLE handle;
+	CapSocket *pair;
+	int port;
+};
+//Hàm khởi tạo Server để lắng nghe các kết nối
+void StartServer();
+//Thread giao tiếp giữa Client và Proxy Server
+UINT ClientToProxy(void *LPsocket);
+//Thread giao tiếp giữa Proxy Server và Remote Server
+UINT ProxyToServer(void *LPParam);
+//Đóng các giao tiếp lại
+void CloseServer();
+//Nhận input từ console, nhập x để dừng Server
+UINT GetKeyStop(void *LPbool);
+//Lấy địa chỉ, port và tạo truy vấn từ truy vấn nhận được từ Client
+void GetAddrAndPort(string &buf, string &address, int &port);
+//Tách chuỗi
+void Split(string str, vector<string> &res, char delim = ' ');
+//Chuyển char array sang dạng LPCWSTR
+wchar_t *CharArrayToLPCWSTR(const char* charArray);
+//Load file blacklist.conf
+void LoadBlackList(vector<string> &arr);
+//Kiểm tra xem địa chỉ có nằm trong black list hay không
+bool CheckServerName(string ServerName);
+//Lấy địa chỉ IP để yêu cầu kết nối
+sockaddr_in* GetServer(string ServerName, char*hostname);
+
+typedef SOCKET Socket;
+vector<string> BlackList;
+//Chuỗi trả về khi nằm trong black list
+string Forbidden = "HTTP/1.0 403 Forbidden\r\n\Cache-Control: no-cache\r\n\Connection: close\r\n";
+//Socket dùng để lắng nghe các truy cập mới
+Socket Listen;
+bool run = 1;
+
+int main()
+{
+	int nRetCode = 0;
+
+	HMODULE hModule = ::GetModuleHandle(nullptr);
+
+	if (hModule != nullptr)
+	{
+		// initialize MFC and print and error on failure
+		if (!AfxWinInit(hModule, nullptr, ::GetCommandLine(), 0))
+		{
+			// TODO: change error code to suit your needs
+			wprintf(L"Fatal Error: MFC initialization failed\n");
+			nRetCode = 1;
+		}
+		else
+		{
+
+			StartServer();
+			while (run) {
+				Sleep(1000);
+			}
+			CloseServer();
+		}
+	}
+	else
+	{
+		// TODO: change error code to suit your needs
+		wprintf(L"Fatal Error: GetModuleHandle failed\n");
+		nRetCode = 1;
+	}
+
+	return nRetCode;
+}
+
+void StartServer()
+{
+	sockaddr_in local;
+	Socket listen_socket;
+	WSADATA wsaData;
+	//Cài đặt các Socket
+	if (WSAStartup(0x202, &wsaData) != 0)
+	{
+		cout << "\nLoi khoi tao socket\n";
+		WSACleanup(); 
+		return;
+	}
+	// Khởi tạo đạ chỉ và cổng
+	local.sin_family = AF_INET; // Mở socket theo giao thức Internet (sử dụng địa chỉ IP để kết nối)
+	local.sin_addr.s_addr = INADDR_ANY;
+	local.sin_port = htons(PORT); // Đợi UDP datagram ở cổng 8888
+	listen_socket = socket(AF_INET, SOCK_STREAM, 0);
+	//Khỏi tạo socket
+	if (listen_socket == INVALID_SOCKET)
+	{
+		cout << "\nSocket khoi tao khong hop le.";
+		WSACleanup();
+		return;
+	}
+	//Bind Socket vào địa chỉ cục bộ và cổng 8888
+	if (bind(listen_socket, (sockaddr *)&local, sizeof(local)) != 0)
+	{
+		cout << "\n Loi khi bind socket.";
+		WSACleanup();
+		return;
+	};
+	//Bắt đầu lắng nghe các truy cập
+	if (listen(listen_socket, 5) != 0)
+	{
+		cout << "\n Loi khi nghe."; 
+		WSACleanup(); 
+		return;
+	}
+	LoadBlackList(BlackList);
+	if (BlackList.size() == 0) {
+		cout << "Khong the load duoc blacklist" << endl;
+	}
+	Listen = listen_socket;
+	//Bắt đầu thread giao tiếp giữa Client và Proxy Server
+	AfxBeginThread(ClientToProxy, (LPVOID)listen_socket);
+	//Bắt đầu thread đợi input console để dừng 
+	CWinThread* p = AfxBeginThread(GetKeyStop, &run);
+}
+
+UINT ClientToProxy(void * LPsocket)
+{
+	Socket sock = (Socket)LPsocket;
+	CapSocket Pair;
+	SOCKET SClient;
+	sockaddr_in addr;
+	int addrLen = sizeof(addr);
+	//Truy cập mới
+	SClient = accept(sock, (sockaddr*)&addr, &addrLen);
+	//Khỏi tạo một thread khác để tiếp tục lắng nghe
+	AfxBeginThread(ClientToProxy, LPsocket);
+	char Buffer[BSIZE];
+	int Len;
+	Pair.IsServerClosed = FALSE;
+	Pair.IsClientClosed = FALSE;
+	Pair.Client = SClient;
+	//Nhận truy vấn gởi tới từ Client
+	int returnval = recv(Pair.Client, Buffer, BSIZE, 0);
+	if (returnval == SOCKET_ERROR) {
+		cout << "\nloi khi nhan yeu cau" << endl;
+		if (!Pair.IsClientClosed) {
+			closesocket(Pair.Client);
+			Pair.IsClientClosed = TRUE;
+		}
+	}
+	if (returnval == 0) {
+		cout << "\nclient ngat ket noi" << endl;
+		if (!Pair.IsClientClosed) {
+			closesocket(Pair.Client);
+			Pair.IsClientClosed = TRUE;
+		}
+	}
+	string buf(Buffer), address;
+	int port;
+	GetAddrAndPort(buf, address, port);
+	bool check = FALSE;
+	if (!CheckServerName(address)) {
+		//Nếu địa chỉ nằm trong black list sẽ trả về 403 và không gởi truy vấn tới remote server
+		returnval = send(Pair.Client, Forbidden.c_str(), Forbidden.size(), 0);
+		check = TRUE;
+		Sleep(2000);
+	}
+	TruyVan P;
+	P.handle = CreateEvent(NULL, TRUE, FALSE, NULL);
+	P.address = address;
+	P.port = port;
+	P.pair = &Pair;
+	if (check == FALSE) {
+		//Bắt đầu thread giao tiếp giữa Proxy Server và Remote Server
+		CWinThread* pThread = AfxBeginThread(ProxyToServer, (LPVOID)&P);
+		//Đợi cho Proxy kết nối với Server
+		WaitForSingleObject(P.handle, 6000);
+		CloseHandle(P.handle);
+		while (Pair.IsClientClosed == FALSE
+			&& Pair.IsServerClosed == FALSE) {
+			//Proxy gởi truy vấn
+			returnval = send(Pair.Server, Buffer, returnval, 0);
+			if (returnval == SOCKET_ERROR) {
+				cout << "Send Failed, Error: " << GetLastError();
+				if (Pair.IsServerClosed == FALSE) {
+					closesocket(Pair.Server);
+					Pair.IsServerClosed = TRUE;
+				}
+				continue;
+			}
+			//Tiếp tục nhận các truy vấn từ Client
+			//Vòng lặp này sẽ chạy đến khi nhận hết data, 1 trong 2 Client và Server sẽ ngắt kết nối
+			returnval = recv(Pair.Client, Buffer, BSIZE, 0);
+			if (returnval == SOCKET_ERROR) {
+				cout << "C Receive Failed, Error: " << GetLastError();
+				if (Pair.IsClientClosed == FALSE) {
+					closesocket(Pair.Client);
+					Pair.IsClientClosed = TRUE;
+				}
+				continue;
+			}
+			if (returnval == 0) {
+				cout << "Client closed " << endl;
+				if (Pair.IsClientClosed == FALSE) {
+					closesocket(Pair.Server);
+					Pair.IsClientClosed = TRUE;
+				}
+				break;
+			}
+		}
+		if (Pair.IsServerClosed == FALSE) {
+			closesocket(Pair.Server);
+			Pair.IsServerClosed = TRUE;
+		}
+		if (Pair.IsClientClosed == FALSE) {
+			closesocket(Pair.Client);
+			Pair.IsClientClosed = TRUE;
+		}
+		WaitForSingleObject(pThread->m_hThread, 20000);
+	}
+	else {
+		if (Pair.IsClientClosed == FALSE) {
+			closesocket(Pair.Client);
+			Pair.IsClientClosed = TRUE;
+		}
+	}
+	return 0;
+}
+
+UINT ProxyToServer(void * LPTruyVan)
+{
+	int count = 0;
+	TruyVan *P = (TruyVan*)LPTruyVan;
+	string server_name = P->address;
+	int port = P->port;
+	int status;
+	int addr;
+	char hostname[32] = "";
+	sockaddr_in *server = NULL;
+	cout << "Server Name: " << server_name << endl;
+	server = GetServer(server_name, hostname);
+	if (server == NULL) {
+		cout << "\n Khong the lay dia chi IP" << endl;
+		send(P->pair->Client, Forbidden.c_str(), Forbidden.size(), 0);
+		return -1;
+	}
+	if (strlen(hostname) > 0) {
+		cout << "connecting to:" << hostname << endl;
+		int returnval;
+		char Buffer[BSIZE];
+		Socket Server;
+		Server = socket(AF_INET, SOCK_STREAM, 0);
+		//Kết nối tới địa chỉ IP vừa lấy được
+		if (!(connect(Server, (sockaddr*)server, sizeof(sockaddr)) == 0)) {
+			cout << "Khong the ket noi";
+			send(P->pair->Client, Forbidden.c_str(), Forbidden.size(), 0);
+
+			return -1;
+		}
+		else {
+			cout << "Ket noi thanh cong \n";
+			P->pair->Server = Server;
+			P->pair->IsServerClosed == FALSE;
+			SetEvent(P->handle);
+			int c = 0;
+			while (P->pair->IsClientClosed == FALSE &&
+				P->pair->IsServerClosed == FALSE) {
+				//Nhận data gởi từ Server tới Proxy
+				returnval = recv(P->pair->Server, Buffer, BSIZE, 0);
+				if (returnval == SOCKET_ERROR) {
+					closesocket(P->pair->Server);
+					P->pair->IsServerClosed = TRUE;
+					break;
+				}
+				if (returnval == 0) {
+					cout << "\nServer Closed" << endl;
+					closesocket(P->pair->Server);
+					P->pair->IsServerClosed = TRUE;
+				}
+				//Gởi data đó tới Client
+				//Kết thúc vòng lặp khi đã nhận và gởi hết data
+				returnval = send(P->pair->Client, Buffer, returnval, 0);
+				if (returnval == SOCKET_ERROR) {
+					cout << "\nSend Failed, Error: " << GetLastError();
+					closesocket(P->pair->Client);
+					P->pair->IsClientClosed = TRUE;
+					break;
+				}
+				returnval >= BSIZE ? Buffer[returnval - 1] = 0 : Buffer[returnval] = 0;
+				ZeroMemory(Buffer, BSIZE);
+			}
+			//Đóng socket
+			if (P->pair->IsClientClosed == FALSE) {
+				closesocket(P->pair->Client);
+				P->pair->IsClientClosed = TRUE;
+			}
+			if (P->pair->IsServerClosed == FALSE) {
+				closesocket(P->pair->Server);
+				P->pair->IsServerClosed = TRUE;
+			}
+		}
+	}
+	return 0;
+}
+
+void CloseServer()
+{
+	//Đóng Socket lắng nghe
+	cout << "Close Socket" << endl;
+	closesocket(Listen);
+	WSACleanup();
+}
+
+UINT GetKeyStop(void * LPbool)
+{
+	bool * run = (bool*)LPbool;
+	while (*run) {
+		char c;
+		c = getchar();
+		if (c == 'x') {
+			*run = 0;
+		}
+	}
+	return 0;
+}
+
+void GetAddrAndPort(string &buf, string &address, int &port)
+{
+	vector<string> res;
+	//res[0]: command, res[1]: link, res[2]: proto
+	Split(buf, res);
+	if (res.size() > 0) {
+		int pos = res[1].find(HTTP);
+		if (pos != -1) {
+			string add = res[1].substr(pos + strlen(HTTP));
+			address = add.substr(0, add.find('/'));
+			//Port của HTTP là 80
+			port = 80;
+			string temp;
+			int len = strlen(HTTP) + address.length();
+		}
+	}
+}
+
+void Split(string str, vector<string> &res, char delim)
+{
+	istringstream ss(str);
+	string token;
+	while (getline(ss, token, delim)) {
+		res.push_back(token);
+	}
+}
+
+wchar_t *CharArrayToLPCWSTR(const char* charArray)
+{
+	wchar_t* wString = new wchar_t[4096];
+	MultiByteToWideChar(CP_ACP, 0, charArray, -1, wString, 4096);
+	return wString;
+}
+
+void LoadBlackList(vector<string>& arr)
+{
+	fstream f;
+	f.open("blacklist.conf", ios::in | ios::out);
+	if (f.is_open()) {
+		while (!f.eof()) {
+			string temp;
+			getline(f, temp);
+			if (temp.back() == '\n') {
+				temp.pop_back();
+			}
+			arr.push_back(temp);
+		}
+	}
+}
+
+bool CheckServerName(string server_name) {
+	if (BlackList.size() > 0) {
+		for (auto i : BlackList)
+		{
+			if (i.find(server_name) != string::npos)
+				return 0;
+		}
+	}
+	return 1;
+}
+
+sockaddr_in* GetServer(string server_name,char * hostname)
+{
+	int status;
+	sockaddr_in *server = NULL;
+	if (server_name.size() > 0) {
+		//Kiểm tra xem địa chỉ lấy được ở địa dạng nào www.abc.com hay 192.168.100.1
+		if (isalpha(server_name.at(0))) {
+			addrinfo hints, *res = NULL;
+			ZeroMemory(&hints, sizeof(hints));
+			hints.ai_family = AF_UNSPEC;
+			hints.ai_socktype = SOCK_STREAM;
+			//Lấy thông tin từ địa chỉ lấy được 
+			if ((status = getaddrinfo(server_name.c_str(), "80", &hints, &res)) != 0) {
+				printf("getaddrinfo failed: %s", gai_strerror(status));
+				return NULL;
+			}
+			while (res->ai_next != NULL) {
+				res = res->ai_next;
+			}
+			sockaddr_in * temp = (sockaddr_in*)res->ai_addr;
+			inet_ntop(res->ai_family, &temp->sin_addr, hostname, 32);
+			server = (sockaddr_in*)res->ai_addr;
+			unsigned long addr;
+			inet_pton(AF_INET, hostname, &addr);
+			server->sin_addr.s_addr = addr;
+			server->sin_port = htons(80);
+			server->sin_family = AF_INET;
+		}
+		else {
+			unsigned long addr;
+			inet_pton(AF_INET, server_name.c_str(), &addr);
+			sockaddr_in sa;
+			sa.sin_family = AF_INET;
+			sa.sin_addr.s_addr = addr;
+			if ((status = getnameinfo((sockaddr*)&sa,
+				sizeof(sockaddr), hostname, NI_MAXHOST, NULL, NI_MAXSERV, NI_NUMERICSERV)) != 0) {
+				cout << "Error";
+				return NULL;
+			}
+			server->sin_addr.s_addr = addr;
+			server->sin_family = AF_INET;
+			server->sin_port = htons(80);
+		}
+	}
+
+	return server;
+}
